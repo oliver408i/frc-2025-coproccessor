@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AprilTag Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: sans-serif;
+            background-color: #121212;
+            color: #ffffff;
+        }
+        #container {
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            gap: 20px;
+            padding: 20px;
+        }
+        .video-box {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            flex: 1;
+        }
+        .video-box h2 {
+            margin-bottom: 10px;
+        }
+        img {
+            width: 100%;
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.5);
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div class="video-box">
+            <h2>AprilTag Live Stream</h2>
+            <img src="/video_feed">
+        </div>
+        <div class="video-box">
+            <h2>Raw Live Stream</h2>
+            <img src="/raw_video_feed">
+        </div>
+    </div>
+</body>
+</html>
