@@ -3,7 +3,7 @@ import cv2
 from pupil_apriltags import Detector
 import socket  # Import socket module
 import time, struct
-from flask import Flask, render_template, Response
+from flask import Flask, render_template, Response # type: ignore
 import concurrent.futures
 
 import base64
@@ -29,7 +29,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return render_template('index.html')  # Create this file in the 'templates' folder
+    return render_template('index.html')  # See templates folder, this is the video client
 
 @njit(cache=True, fastmath=True) # JIT compile this heavy math function, cache for faster compilation next run, fastmath for less precise, but faster, which is ok in our case
 def extract_euler_angles(R):
@@ -88,8 +88,6 @@ if not cap.isOpened():
     print("Error: Could not open video stream.")
     exit(1)
 
-x_target = 0  # Define your desired X target
-z_target = 0  # Define your desired Z target
 last_sent_zero_time = None
 
 import signal
@@ -99,12 +97,11 @@ def handle_sigint(signum, frame):
     cap.release()
     client_socket.close()
     cv2.destroyAllWindows()
-    executor.shutdown()
     exit(0)
 
 signal.signal(signal.SIGINT, handle_sigint)
 
-SEND_EVERY_N_FRAMES = 1  # Adjust this value as needed
+SEND_EVERY_N_FRAMES = 1  # If network is getting oversaturated, turn this up
 frame_counter = 0
 
 latest_frame = None
@@ -116,55 +113,6 @@ frame_lock = threading.Lock()
 annotated_frame_lock = threading.Lock()
 
 print("Locks initialized.")
-
-last_sent_time = time.time()
-
-def send_frames():
-    global last_sent_time, sending_frame
-    while True:
-        now = time.time()
-        if now - last_sent_time < 1 / 15:
-            time.sleep(0.01)
-            continue
-
-        if sending_frame:
-            continue  # Prevent buildup of latency
-
-        with annotated_frame_lock:
-            if annotated_frame is None:
-                continue
-            frame_copy = annotated_frame.copy()
-
-        success, buffer = cv2.imencode('.jpg', frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        if not success:
-            continue
-
-        base64_frame = base64.b64encode(buffer).decode('utf-8')
-        sending_frame = True
-        
-        last_sent_time = now
-
-def done_sending():
-    global sending_frame
-    sending_frame = False
-
-def process_frame():
-    global latest_frame
-    while True:
-        cap.grab()  # Grab the latest frame, discard the rest
-        ret, frame = cap.retrieve()
-        if not ret or frame is None:
-            continue
-        
-        with frame_lock:
-            latest_frame = frame.copy()
-        success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        if not success:
-            continue
-        
-
-print("Threads starting...")
-time.sleep(1)  # Allow camera to warm up
 
 print("Compiling JIT functions...")
 # Prime Numba functions to avoid first-call delay
@@ -278,10 +226,6 @@ def video_feed():
 @app.route('/raw_video_feed')
 def raw_video_feed():
     return Response(generate_raw_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-executor.submit(process_frame)
-executor.submit(tag_detection_loop)
 
 print("Starting server...")
 app.run(host="0.0.0.0", port=5000)
