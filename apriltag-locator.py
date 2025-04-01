@@ -4,7 +4,7 @@ from pupil_apriltags import Detector
 import socket  # Import socket module
 import time, struct
 from flask import Flask, render_template, Response # type: ignore
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 
 import base64
 import threading
@@ -82,10 +82,21 @@ cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to red
 cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # 0.25 = manual mode (on some cameras)
 cap.set(cv2.CAP_PROP_EXPOSURE, -7) 
 
-print("Video capture started.")
+cap2 = cv2.VideoCapture(2, cv2.CAP_V4L2)
+cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
+cap2.set(cv2.CAP_PROP_FPS, 60)
+cap2.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap2.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to reduce capture latency
+
+print("Video captures started.")
 
 if not cap.isOpened():
     print("Error: Could not open video stream.")
+    exit(1)
+
+if not cap2.isOpened():
+    print("Error: Could not open video stream 2.")
     exit(1)
 
 last_sent_zero_time = None
@@ -95,6 +106,7 @@ import signal
 def handle_sigint(signum, frame):
     print("\nInterrupt received, releasing resources...")
     cap.release()
+    executor.shutdown()
     client_socket.close()
     cv2.destroyAllWindows()
     exit(0)
@@ -105,12 +117,16 @@ SEND_EVERY_N_FRAMES = 1  # If network is getting oversaturated, turn this up
 frame_counter = 0
 
 latest_frame = None
+latest_intake_frame = None
+intake_annotated_frame = None
 annotated_frame = None
 
 print("Starting threads...")
 frame_lock = threading.Lock()
 
 annotated_frame_lock = threading.Lock()
+intake_frame_lock = threading.Lock()
+intake_annotated_frame_lock = threading.Lock()
 
 print("Locks initialized.")
 
@@ -118,7 +134,30 @@ print("Compiling JIT functions...")
 # Prime Numba functions to avoid first-call delay
 extract_euler_angles(np.eye(3))
 find_closest_tag_index(np.random.rand(10, 3))
- 
+
+def capture_main_frame():
+    global latest_frame
+    while True:
+        cap.grab()
+        ret, frame = cap.retrieve()
+        if not ret or frame is None:
+            continue
+        with frame_lock:
+            latest_frame = frame
+
+def capture_intake_frame():
+    global latest_intake_frame
+    while True:
+        cap2.grab()
+        ret, frame = cap2.retrieve()
+        if not ret or frame is None:
+            continue
+        with intake_frame_lock:
+            latest_intake_frame = frame
+
+executor = ThreadPoolExecutor(max_workers=5)
+executor.submit(capture_main_frame)
+executor.submit(capture_intake_frame)
 
 print("Executors started.")
 
@@ -194,7 +233,68 @@ def tag_detection_loop():
 
                     last_sent_zero_time = time.time()
 
- 
+executor.submit(tag_detection_loop)
+
+def tag_intake_loop():
+    global latest_intake_frame, intake_annotated_frame
+    print("Starting tag intake loop...")
+    MIN_AREA = 500  # Minimum contour area to be considered a pipe
+
+    while True:
+        with intake_frame_lock:
+            if latest_intake_frame is None:
+                continue
+            frame = latest_intake_frame.copy()
+
+        # Convert to HSV and apply white color mask
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        lower_white = np.array([20, 0, 180])   # Slight yellow tint
+        upper_white = np.array([40, 80, 255])
+        mask = cv2.inRange(hsv, lower_white, upper_white)
+
+        # Additional mask for shadows (darker grays)
+        lower_shadow = np.array([0, 0, 50])
+        upper_shadow = np.array([180, 50, 150])
+        shadow_mask = cv2.inRange(hsv, lower_shadow, upper_shadow)
+
+        # Additional mask for dark-red text
+        lower_red1 = np.array([0, 100, 50])
+        upper_red1 = np.array([10, 255, 150])
+        lower_red2 = np.array([160, 100, 50])
+        upper_red2 = np.array([180, 255, 150])
+        red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+
+        # Combine all masks
+        mask = cv2.bitwise_or(mask, shadow_mask)
+        mask = cv2.bitwise_or(mask, red_mask)
+
+        # Morphological cleanup
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel)
+
+        # Find contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        annotated = frame.copy()
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < MIN_AREA:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect_ratio = float(w) / h
+            if 1.5 < aspect_ratio < 10:  # Looks like a pipe seen from the side
+                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(annotated, "Pipe", (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        with intake_annotated_frame_lock:
+            intake_annotated_frame = annotated.copy()
+
+executor.submit(tag_intake_loop)
+
 def generate_mjpeg():
     while True:
         with annotated_frame_lock:
@@ -219,6 +319,18 @@ def generate_raw_mjpeg():
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
+def generate_intake_mjpeg():
+    while True:
+        with intake_annotated_frame_lock:
+            if intake_annotated_frame is None:
+                continue
+            ret, jpeg = cv2.imencode('.jpg', intake_annotated_frame)
+            if not ret:
+                continue
+            frame = jpeg.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -226,6 +338,10 @@ def video_feed():
 @app.route('/raw_video_feed')
 def raw_video_feed():
     return Response(generate_raw_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/intake_video_feed')
+def video_intake_feed():
+    return Response(generate_intake_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 print("Starting server...")
 app.run(host="0.0.0.0", port=5000)

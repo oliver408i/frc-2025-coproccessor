@@ -11,41 +11,61 @@
             font-family: sans-serif;
             background-color: #121212;
             color: #ffffff;
+            min-height: 100vh;
+            height: 100vh;
+            overflow-y: auto;
         }
         #container {
             display: flex;
+            flex-wrap: wrap;
             justify-content: center;
             align-items: flex-start;
-            gap: 20px;
-            padding: 20px;
+            max-width: 100vw;
+            box-sizing: border-box;
         }
         .video-box {
             display: flex;
             flex-direction: column;
             align-items: center;
-            flex: 1;
-        }
-        .video-box h2 {
-            margin-bottom: 10px;
+            flex: 1 1 30%;
+            max-width: 100%;
         }
         img {
             width: 100%;
             max-width: 100%;
+            max-height: calc(100vh / 2.3);
             height: auto;
+            aspect-ratio: 4 / 3;
+            object-fit: contain;
             border-radius: 8px;
             box-shadow: 0 0 10px rgba(0,0,0,0.5);
+        }
+        @media (max-width: 768px) {
+            .video-box {
+                flex: 1 1 100%;
+            }
+            img {
+                width: 100%;
+                height: auto;
+            }
         }
     </style>
 </head>
 <body>
     <div id="container">
         <div class="video-box">
-            <h2>AprilTag Live Stream</h2>
+            <h3>AprilTag Live Stream</h3>
             <img src="/video_feed">
         </div>
         <div class="video-box">
-            <h2>Raw Live Stream</h2>
+            <h3>Raw Live Stream</h2>
             <img src="/raw_video_feed">
+        </div>
+    </div>
+    <div id="container">
+        <div class="video-box">
+            <h3>Intake Live Stream</h3>
+            <img src="/intake_video_feed">
         </div>
     </div>
 </body>
