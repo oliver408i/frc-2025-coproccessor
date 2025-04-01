@@ -3,12 +3,18 @@ import cv2
 from pupil_apriltags import Detector
 import socket  # Import socket module
 import time, struct
-from flask import Flask, render_template, Response # type: ignore
 from concurrent.futures import ThreadPoolExecutor
+import asyncio
+from aiohttp import web
+from aiortc import RTCPeerConnection, VideoStreamTrack, RTCSessionDescription
+import av
+from aiortc.rtcrtpsender import RTCRtpSender
+from aiortc.contrib.media import MediaRelay
 
 import base64
 import threading
 from numba import njit
+import json
 
 last_detection_time = time.time()
 raw_frame = None
@@ -25,11 +31,11 @@ client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 camera_matrix = np.load("camera_matrix.npy")
 dist_coeffs = np.load("dist_coeffs.npy")
 
-app = Flask(__name__)
+pcs = set()
+relay = MediaRelay()
 
-@app.route('/')
-def index():
-    return render_template('index.html')  # See templates folder, this is the video client
+async def index(request):
+    return web.FileResponse('templates/index.html')
 
 @njit(cache=True, fastmath=True) # JIT compile this heavy math function, cache for faster compilation next run, fastmath for less precise, but faster, which is ok in our case
 def extract_euler_angles(R):
@@ -73,11 +79,13 @@ TAG_SIZE = 0.12  # Tag size in meters (12 cm)
 
 print("Starting video capture...")
 
+RES = (640, 480)
+
 cap = cv2.VideoCapture(0, cv2.CAP_V4L2)  # Use webcam
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
 cap.set(cv2.CAP_PROP_FPS, 60)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, RES[0])
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RES[1])
 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to reduce capture latency
 cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # 0.25 = manual mode (on some cameras)
 cap.set(cv2.CAP_PROP_EXPOSURE, -7) 
@@ -85,8 +93,8 @@ cap.set(cv2.CAP_PROP_EXPOSURE, -7)
 cap2 = cv2.VideoCapture(2, cv2.CAP_V4L2)
 cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
 cap2.set(cv2.CAP_PROP_FPS, 60)
-cap2.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap2.set(cv2.CAP_PROP_FRAME_WIDTH, RES[0])
+cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, RES[1])
 cap2.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to reduce capture latency
 
 print("Video captures started.")
@@ -118,7 +126,6 @@ frame_counter = 0
 
 latest_frame = None
 latest_intake_frame = None
-intake_annotated_frame = None
 annotated_frame = None
 
 print("Starting threads...")
@@ -155,7 +162,7 @@ def capture_intake_frame():
         with intake_frame_lock:
             latest_intake_frame = frame
 
-executor = ThreadPoolExecutor(max_workers=5)
+executor = ThreadPoolExecutor(max_workers=10)
 executor.submit(capture_main_frame)
 executor.submit(capture_intake_frame)
 
@@ -295,53 +302,149 @@ def tag_intake_loop():
 
 executor.submit(tag_intake_loop)
 
-def generate_mjpeg():
-    while True:
-        with annotated_frame_lock:
-            if annotated_frame is None:
-                continue
-            ret, jpeg = cv2.imencode('.jpg', annotated_frame)
-            if not ret:
-                continue
-            frame = jpeg.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+class VideoCameraTrack(VideoStreamTrack):
+    def __init__(self, source='main', fps_override=None):
+        super().__init__()
+        self.source = source
+        self.last_frame_time = 0
+        self.fps_override = fps_override
 
-def generate_raw_mjpeg():
-    while True:
-        with frame_lock:
-            if latest_frame is None:
-                continue
-            ret, jpeg = cv2.imencode('.jpg', latest_frame)
-            if not ret:
-                continue
-            frame = jpeg.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+    async def recv(self):
+        # max_fps = self.fps_override["value"] if self.fps_override else 20
+        # frame_interval = 1 / max_fps
+        # now = time.time()
 
-def generate_intake_mjpeg():
-    while True:
-        with intake_annotated_frame_lock:
-            if intake_annotated_frame is None:
-                continue
-            ret, jpeg = cv2.imencode('.jpg', intake_annotated_frame)
-            if not ret:
-                continue
-            frame = jpeg.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        # if now - self.last_frame_time < frame_interval:
+        #     await asyncio.sleep(0.001)
+        #     return await self.recv()
 
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+        # self.last_frame_time = now
+        pts, time_base = await self.next_timestamp()
+        
+        if self.source == 'main':
+            with frame_lock:
+                frame = latest_frame.copy() if latest_frame is not None else None
+        elif self.source == 'intake':
+            with intake_frame_lock:
+                frame = latest_intake_frame.copy() if latest_intake_frame is not None else None
+        elif self.source == 'annotated':
+            with annotated_frame_lock:
+                frame = annotated_frame.copy() if annotated_frame is not None else None
+        else:
+            return None
 
-@app.route('/raw_video_feed')
-def raw_video_feed():
-    return Response(generate_raw_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+        if frame is None:
+            await asyncio.sleep(1 / 30)
+            return await self.recv()
+        #frame = cv2.resize(frame, (320, int(frame.shape[0] * 320 / frame.shape[1])))
 
-@app.route('/intake_video_feed')
-def video_intake_feed():
-    return Response(generate_intake_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+        now_str = time.strftime("%H:%M:%S", time.localtime())
+        cv2.putText(frame, f"Time: {now_str}", (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-print("Starting server...")
-app.run(host="0.0.0.0", port=5000)
+        frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
+
+        
+
+        frame.pts = pts
+        frame.time_base = time_base
+
+        #self.last_frame_time = time.time()
+        return frame
+
+async def offer(request):
+    if request.method == "OPTIONS":
+        return web.Response(
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
+            }
+        )
+
+    stream_id = request.match_info.get('stream_id', 'main')
+    
+    def set_bandwidth(sdp, kbps=2000):
+        lines = sdp.split("\n")
+        for i, line in enumerate(lines):
+            if line.startswith("m=video"):
+                lines.insert(i + 1, f"b=AS:{kbps}")
+                break
+        return "\n".join(lines)
+    
+    params = await request.json()
+
+    sdp = set_bandwidth(params["sdp"], kbps=4000)
+    #sdp = params["sdp"]
+    offer = RTCSessionDescription(sdp=sdp, type=params["type"])
+
+    pc = RTCPeerConnection()
+    pcs.add(pc)
+
+    # Force H264 codec on sender
+    def force_codec(pc, sender, forced_codec):
+        kind = forced_codec.split("/")[0]
+        codecs = RTCRtpSender.getCapabilities(kind).codecs
+        transceiver = next(t for t in pc.getTransceivers() if t.sender == sender)
+        transceiver.setCodecPreferences(
+            [codec for codec in codecs if codec.mimeType == forced_codec]
+        )
+
+    video_track = VideoCameraTrack(source=stream_id, fps_override=None)
+    relayed_track = relay.subscribe(video_track)
+    video_sender = pc.addTrack(relayed_track)
+
+    fps_override = {"value": 10}  # Default max FPS
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        if channel.label == "feedback":
+            @channel.on("message")
+            def on_message(message):
+                try:
+                    data = json.loads(message)
+                    decode_fps = data.get("fps", 0)
+                    fps_override["value"] = min(20, decode_fps-2)
+                    print(f"Client decode FPS: {decode_fps}, adjusted max FPS: {fps_override['value']}")
+                except Exception as e:
+                    print("Failed to parse feedback message:", e)
+
+    force_codec(pc, video_sender, "video/H264") 
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        print(f"Connection state is {pc.connectionState}")
+        if pc.connectionState == "failed":
+            await pc.close()
+            pcs.discard(pc)
+
+    await pc.setRemoteDescription(offer)
+
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    # Filter out IPv6 candidates from the SDP answer
+    sdp_lines = pc.localDescription.sdp.split("\n")
+    filtered_lines = [line for line in sdp_lines if not ("a=candidate" in line and "fd7a:115c:" in line)]
+    local_description = RTCSessionDescription(sdp="\n".join(filtered_lines), type=pc.localDescription.type)
+    
+    return web.Response(
+        content_type="application/json",
+        text=json.dumps({"sdp": local_description.sdp, "type": local_description.type}),
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        }
+    )
+
+async def on_shutdown(app):
+    coros = [pc.close() for pc in pcs]
+    await asyncio.gather(*coros)
+    pcs.clear()
+
+app2 = web.Application()
+app2.router.add_get("/", index)
+app2.router.add_route("OPTIONS", "/offer/{stream_id}", offer)
+app2.router.add_route("POST", "/offer/{stream_id}", offer)
+app2.on_shutdown.append(on_shutdown)
+
+web.run_app(app2, host="0.0.0.0", port=5000)

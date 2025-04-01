@@ -1,72 +1,142 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AprilTag Viewer</title>
-    <style>
-        body {
-            margin: 0;
-            padding: 0;
-            font-family: sans-serif;
-            background-color: #121212;
-            color: #ffffff;
-            min-height: 100vh;
-            height: 100vh;
-            overflow-y: auto;
-        }
-        #container {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: center;
-            align-items: flex-start;
-            max-width: 100vw;
-            box-sizing: border-box;
-        }
-        .video-box {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            flex: 1 1 30%;
-            max-width: 100%;
-        }
-        img {
-            width: 100%;
-            max-width: 100%;
-            max-height: calc(100vh / 2.3);
-            height: auto;
-            aspect-ratio: 4 / 3;
-            object-fit: contain;
-            border-radius: 8px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.5);
-        }
-        @media (max-width: 768px) {
-            .video-box {
-                flex: 1 1 100%;
-            }
-            img {
-                width: 100%;
-                height: auto;
-            }
-        }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>AprilTag WebRTC Viewer</title>
+  <style>
+    body {
+      background-color: #121212;
+      color: white;
+      font-family: sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+    }
+    #controls {
+      margin-bottom: 1rem;
+    }
+    button {
+      background-color: #1f1f1f;
+      color: white;
+      border: 1px solid #333;
+      padding: 0.5rem 1rem;
+      margin: 0 0.5rem;
+      cursor: pointer;
+      border-radius: 4px;
+    }
+    #video-container {
+      display: flex;
+      gap: 1rem;
+    }
+    video {
+      width: 80vw;
+      max-width: 800px;
+      border-radius: 8px;
+      box-shadow: 0 0 15px rgba(0,0,0,0.7);
+    }
+  </style>
 </head>
 <body>
-    <div id="container">
-        <div class="video-box">
-            <h3>AprilTag Live Stream</h3>
-            <img src="/video_feed">
-        </div>
-        <div class="video-box">
-            <h3>Raw Live Stream</h2>
-            <img src="/raw_video_feed">
-        </div>
-    </div>
-    <div id="container">
-        <div class="video-box">
-            <h3>Intake Live Stream</h3>
-            <img src="/intake_video_feed">
-        </div>
-    </div>
+  <h1>AprilTag WebRTC Viewer</h1>
+  <div id="video-container">
+    <video id="video-main" autoplay playsinline muted></video>
+    <video id="video-intake" autoplay playsinline muted></video>
+  </div>
+  <div id="client-time" style="margin-top: 1rem; font-size: 1.2rem;"></div>
+
+  <script>
+    let pc;
+    const defaultStream = 'main';
+
+    function logStats() {
+        if (!pc) return;
+
+        pc.getStats(null).then(stats => {
+            stats.forEach(report => {
+            if (report.type === "inbound-rtp" && report.kind === "video") {
+                console.log("📊 Video Stats:");
+                console.log(`🧲 Codec ID: ${report.codecId}`);
+                console.log(`🎥 Frames Decoded: ${report.framesDecoded}`);
+                console.log(`📦 Packets Received: ${report.packetsReceived}`);
+                console.log(`❌ Packets Lost: ${report.packetsLost}`);
+                console.log(`🕒 Jitter: ${report.jitter}`);
+                console.log(`📶 Bitrate (bps): ${report.bytesReceived}`);
+            }
+
+            if (report.type === "codec" && report.mimeType.includes("H264")) {
+                console.log("Codec Info:", report.mimeType, report.sdpFmtpLine);
+            }
+            });
+        });
+        }
+    
+        setInterval(logStats, 3000);
+
+    async function startStream(streamId, videoId) {
+      const pc = new RTCPeerConnection();
+
+      const feedbackChannel = pc.createDataChannel("feedback");
+
+      setInterval(async () => {
+        if (pc.connectionState !== "connected") return;
+
+        const stats = await pc.getStats();
+        stats.forEach(report => {
+          if (report.type === "inbound-rtp" && report.kind === "video") {
+            const fps = report.framesPerSecond || 0;
+            feedbackChannel.send(JSON.stringify({ fps }));
+          }
+        });
+      }, 1000);
+
+      pc.addTransceiver('video', { direction: 'recvonly' });
+
+      pc.ontrack = (event) => {
+        console.log("Received track:", event.track.kind);
+        const video = document.getElementById(videoId);
+        if (video.srcObject !== event.streams[0]) {
+          video.srcObject = event.streams[0];
+        }
+      };
+
+      const offer = await pc.createOffer();
+      const filteredOffer = {
+        type: offer.type,
+        sdp: offer.sdp
+      };
+
+      await pc.setLocalDescription(filteredOffer);
+
+      const response = await fetch(`offer/${streamId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(filteredOffer)
+      });
+
+      const answer = await response.json();
+
+      if (pc.signalingState !== "stable") {
+        await pc.setRemoteDescription(answer);
+      } else {
+        console.warn("Skipping setRemoteDescription: already stable");
+      }
+    }
+
+    function updateClientTime() {
+      const now = new Date();
+      const formatted = now.toLocaleTimeString();
+      document.getElementById("client-time").textContent = `Client Time: ${formatted}`;
+    }
+    setInterval(updateClientTime, 1000);
+    updateClientTime();
+
+    // Automatically start default streams on load
+    window.onload = () => {
+      startStream('main', 'video-main');
+      startStream('intake', 'video-intake');
+    };
+  </script>
 </body>
 </html>
