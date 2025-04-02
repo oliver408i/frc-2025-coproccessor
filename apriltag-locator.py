@@ -31,6 +31,12 @@ client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 camera_matrix = np.load("camera_matrix.npy")
 dist_coeffs = np.load("dist_coeffs.npy")
 
+latest_tag_info = None
+tag_info_lock = threading.Lock()
+frame_lock = threading.Lock()
+intake_frame_lock = threading.Lock()  # Added intake_frame_lock
+intake_annotated_frame_lock = threading.Lock()
+
 @njit(cache=True, fastmath=True) # JIT compile this heavy math function, cache for faster compilation next run, fastmath for less precise, but faster, which is ok in our case
 def extract_euler_angles(R):
     sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
@@ -120,16 +126,11 @@ frame_counter = 0
 
 latest_frame = None
 latest_intake_frame = None
-annotated_frame = None
 combined_frame = None
 
 
 print("Starting threads...")
 frame_lock = threading.Lock()
-
-annotated_frame_lock = threading.Lock()
-intake_frame_lock = threading.Lock()
-intake_annotated_frame_lock = threading.Lock()
 
 print("Locks initialized.")
 
@@ -155,7 +156,7 @@ def capture_intake_frame():
         ret, frame = cap2.retrieve()
         if not ret or frame is None:
             continue
-        with intake_frame_lock:
+        with intake_frame_lock:  # Updated to reapply thread safety
             latest_intake_frame = frame
 
 executor = ThreadPoolExecutor(max_workers=10)
@@ -165,7 +166,7 @@ executor.submit(capture_intake_frame)
 print("Executors started.")
 
 def tag_detection_loop():
-    global last_detection_time, last_sent_zero_time, annotated_frame, frame_counter
+    global last_detection_time, last_sent_zero_time, frame_counter, latest_tag_info
     print("Starting tag detection loop...")
     while True:
         with frame_lock:
@@ -195,6 +196,8 @@ def tag_detection_loop():
             closest_tag = tag_data[idx]
         else:
             closest_tag = None
+            with tag_info_lock:
+                latest_tag_info = {"v": None, "l": []}
         
         if closest_tag:
             tag, tvec, rvec = closest_tag
@@ -212,19 +215,14 @@ def tag_detection_loop():
                 client_socket.sendto(struct.pack("ffffff", 0, 0, 0, x_offset, z_offset, pitchd), (IP_ADDRESS, PORT))
                 #print("Sent PID corrections:", x_correction, z_correction, yaw_correction)
             
-            cv2.putText(frame, f"X: {x_offset:.2f}m, Y: {y_offset:.2f}m, Z: {z_offset:.2f}m", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, f"Roll: {np.degrees(roll):.2f}, Pitch: {pitchd:.2f}, Yaw: {np.degrees(yaw):.2f}", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, f"Raw tvec: X={tvec[0][0]:.2f}, Y={tvec[1][0]:.2f}, Z={tvec[2][0]:.2f}", (10, 120),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            for i in range(4):
-                pt1 = tuple(corners[i].astype(int))
-                pt2 = tuple(corners[(i + 1) % 4].astype(int))
-                cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
-        with annotated_frame_lock:
-            annotated_frame = frame.copy()
+            with tag_info_lock:
+                latest_tag_info = {
+                    "v": [round(x_offset, 2), round(y_offset, 2), round(z_offset, 2),
+                          round(np.degrees(roll), 1), round(pitchd, 1), round(np.degrees(yaw), 1)],
+                    "l": [[int(corners[i][0]), int(corners[i][1]),
+                           int(corners[(i + 1) % 4][0]), int(corners[(i + 1) % 4][1])]
+                          for i in range(4)]
+                }
 
         if tags:
             last_detection_time = time.time()
@@ -244,7 +242,7 @@ def tag_intake_loop():
     MIN_AREA = 500  # Minimum contour area to be considered a pipe
 
     while True:
-        with intake_frame_lock:
+        with intake_frame_lock:  # Updated to reapply thread safety
             if latest_intake_frame is None:
                 continue
             frame = latest_intake_frame.copy()
@@ -301,7 +299,6 @@ executor.submit(tag_intake_loop)
 def frame_combiner_loop():
     global combined_frame
     latest_main = None
-    latest_annotated = None
     latest_intake = None
 
     while True:
@@ -314,14 +311,6 @@ def frame_combiner_loop():
                     updated = True
             finally:
                 frame_lock.release()
-
-        if annotated_frame_lock.acquire(blocking=False):
-            try:
-                if annotated_frame is not None:
-                    latest_annotated = annotated_frame.copy()
-                    updated = True
-            finally:
-                annotated_frame_lock.release()
 
         if intake_frame_lock.acquire(blocking=False):
             try:
@@ -336,7 +325,7 @@ def frame_combiner_loop():
             continue
 
         labeled_frames = []
-        for label, frame in zip(["Main", "Annotated", "Intake"], [latest_main, latest_annotated, latest_intake]):
+        for label, frame in zip(["Main", "Intake"], [latest_main, latest_intake]):
             if frame is None:
                 continue
             labeled = frame.copy()
@@ -384,13 +373,35 @@ def tcp_frame_streaming():
                     continue
                 last_send_time = now
 
-                success, encoded = cv2.imencode('.jpg', combined_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                success, encoded = cv2.imencode('.jpg', combined_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
                 if not success:
                     continue
 
                 data = encoded.tobytes()
-                timestamp = time.time()
-                payload = struct.pack(">d{}s".format(len(data)), timestamp, data)
+                tag_json = ""
+                with tag_info_lock:
+                    if latest_tag_info is not None:
+                        def convert(obj):
+                            if isinstance(obj, np.generic):
+                                return obj.item()
+                            if isinstance(obj, tuple):
+                                return [convert(i) for i in obj]
+                            if isinstance(obj, list):
+                                return [convert(i) for i in obj]
+                            if isinstance(obj, dict):
+                                return {k: convert(v) for k, v in obj.items()}
+                            return obj
+
+                        safe_tag_info = convert(latest_tag_info)
+                        tag_json = json.dumps(safe_tag_info)
+                    else:
+                        tag_json = json.dumps({"text_lines": ["No tag detected"], "lines": []})
+
+                tag_bytes = tag_json.encode("utf-8")
+                tag_length = len(tag_bytes)
+
+                # Format: [unsigned short tag_len][tag_json][jpeg_data]
+                payload = struct.pack(">H", tag_length) + tag_bytes + data
                 length = struct.pack(">L", len(payload))
                 try:
                     conn.sendall(length + payload)
