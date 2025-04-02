@@ -5,16 +5,13 @@ import socket  # Import socket module
 import time, struct
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
-from aiohttp import web
-from aiortc import RTCPeerConnection, VideoStreamTrack, RTCSessionDescription
-import av
-from aiortc.rtcrtpsender import RTCRtpSender
-from aiortc.contrib.media import MediaRelay
 
-import base64
 import threading
 from numba import njit
 import json
+import struct
+import socket
+import threading
 
 last_detection_time = time.time()
 raw_frame = None
@@ -27,15 +24,12 @@ PORT = 1234
 # Create a persistent UDP socket
 client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+# Enable UDP broadcasting globally
+client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
 # Load camera calibration parameters
 camera_matrix = np.load("camera_matrix.npy")
 dist_coeffs = np.load("dist_coeffs.npy")
-
-pcs = set()
-relay = MediaRelay()
-
-async def index(request):
-    return web.FileResponse('templates/index.html')
 
 @njit(cache=True, fastmath=True) # JIT compile this heavy math function, cache for faster compilation next run, fastmath for less precise, but faster, which is ok in our case
 def extract_euler_angles(R):
@@ -127,6 +121,8 @@ frame_counter = 0
 latest_frame = None
 latest_intake_frame = None
 annotated_frame = None
+combined_frame = None
+
 
 print("Starting threads...")
 frame_lock = threading.Lock()
@@ -302,149 +298,108 @@ def tag_intake_loop():
 
 executor.submit(tag_intake_loop)
 
-class VideoCameraTrack(VideoStreamTrack):
-    def __init__(self, source='main', fps_override=None):
-        super().__init__()
-        self.source = source
-        self.last_frame_time = 0
-        self.fps_override = fps_override
+def frame_combiner_loop():
+    global combined_frame
+    latest_main = None
+    latest_annotated = None
+    latest_intake = None
 
-    async def recv(self):
-        # max_fps = self.fps_override["value"] if self.fps_override else 20
-        # frame_interval = 1 / max_fps
-        # now = time.time()
+    while True:
+        updated = False
 
-        # if now - self.last_frame_time < frame_interval:
-        #     await asyncio.sleep(0.001)
-        #     return await self.recv()
+        if frame_lock.acquire(blocking=False):
+            try:
+                if latest_frame is not None:
+                    latest_main = latest_frame.copy()
+                    updated = True
+            finally:
+                frame_lock.release()
 
-        # self.last_frame_time = now
-        pts, time_base = await self.next_timestamp()
-        
-        if self.source == 'main':
-            with frame_lock:
-                frame = latest_frame.copy() if latest_frame is not None else None
-        elif self.source == 'intake':
-            with intake_frame_lock:
-                frame = latest_intake_frame.copy() if latest_intake_frame is not None else None
-        elif self.source == 'annotated':
-            with annotated_frame_lock:
-                frame = annotated_frame.copy() if annotated_frame is not None else None
-        else:
-            return None
+        if annotated_frame_lock.acquire(blocking=False):
+            try:
+                if annotated_frame is not None:
+                    latest_annotated = annotated_frame.copy()
+                    updated = True
+            finally:
+                annotated_frame_lock.release()
 
-        if frame is None:
-            await asyncio.sleep(1 / 30)
-            return await self.recv()
-        #frame = cv2.resize(frame, (320, int(frame.shape[0] * 320 / frame.shape[1])))
+        if intake_frame_lock.acquire(blocking=False):
+            try:
+                if latest_intake_frame is not None:
+                    latest_intake = latest_intake_frame.copy()
+                    updated = True
+            finally:
+                intake_frame_lock.release()
 
-        now_str = time.strftime("%H:%M:%S", time.localtime())
-        cv2.putText(frame, f"Time: {now_str}", (10, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        if not updated:
+            time.sleep(0.005)
+            continue
 
-        frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
+        labeled_frames = []
+        for label, frame in zip(["Main", "Annotated", "Intake"], [latest_main, latest_annotated, latest_intake]):
+            if frame is None:
+                continue
+            labeled = frame.copy()
+            cv2.putText(labeled, label, (10, labeled.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+            labeled_frames.append(labeled)
 
-        
+        if not labeled_frames:
+            continue
 
-        frame.pts = pts
-        frame.time_base = time_base
+        height, width = labeled_frames[0].shape[:2]
+        for i in range(len(labeled_frames)):
+            labeled_frames[i] = cv2.resize(labeled_frames[i], (width, height))
 
-        #self.last_frame_time = time.time()
-        return frame
+        combined_frame = cv2.vconcat(labeled_frames)
 
-async def offer(request):
-    if request.method == "OPTIONS":
-        return web.Response(
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "POST, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type",
-            }
-        )
+threading.Thread(target=frame_combiner_loop, daemon=True).start()
 
-    stream_id = request.match_info.get('stream_id', 'main')
-    
-    def set_bandwidth(sdp, kbps=2000):
-        lines = sdp.split("\n")
-        for i, line in enumerate(lines):
-            if line.startswith("m=video"):
-                lines.insert(i + 1, f"b=AS:{kbps}")
-                break
-        return "\n".join(lines)
-    
-    params = await request.json()
 
-    sdp = set_bandwidth(params["sdp"], kbps=4000)
-    #sdp = params["sdp"]
-    offer = RTCSessionDescription(sdp=sdp, type=params["type"])
+def tcp_frame_streaming():
+    TCP_PORT = 9999
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    server_socket.bind(("", TCP_PORT))
+    server_socket.listen(1)
+    print(f"[+] Waiting for TCP client on port {TCP_PORT}...")
 
-    pc = RTCPeerConnection()
-    pcs.add(pc)
+    while True:
+        conn, addr = server_socket.accept()
+        print(f"[+] TCP client connected from {addr}")
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    # Force H264 codec on sender
-    def force_codec(pc, sender, forced_codec):
-        kind = forced_codec.split("/")[0]
-        codecs = RTCRtpSender.getCapabilities(kind).codecs
-        transceiver = next(t for t in pc.getTransceivers() if t.sender == sender)
-        transceiver.setCodecPreferences(
-            [codec for codec in codecs if codec.mimeType == forced_codec]
-        )
+        try:
+            last_send_time = 0
+            SEND_INTERVAL = 1/20
 
-    video_track = VideoCameraTrack(source=stream_id, fps_override=None)
-    relayed_track = relay.subscribe(video_track)
-    video_sender = pc.addTrack(relayed_track)
+            while True:
+                if combined_frame is None:
+                    time.sleep(0.005)
+                    continue
 
-    fps_override = {"value": 10}  # Default max FPS
+                now = time.time()
+                if now - last_send_time < SEND_INTERVAL:
+                    time.sleep(0.0001)
+                    continue
+                last_send_time = now
 
-    @pc.on("datachannel")
-    def on_datachannel(channel):
-        if channel.label == "feedback":
-            @channel.on("message")
-            def on_message(message):
+                success, encoded = cv2.imencode('.jpg', combined_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                if not success:
+                    continue
+
+                data = encoded.tobytes()
+                timestamp = time.time()
+                payload = struct.pack(">d{}s".format(len(data)), timestamp, data)
+                length = struct.pack(">L", len(payload))
                 try:
-                    data = json.loads(message)
-                    decode_fps = data.get("fps", 0)
-                    fps_override["value"] = min(20, decode_fps-2)
-                    print(f"Client decode FPS: {decode_fps}, adjusted max FPS: {fps_override['value']}")
-                except Exception as e:
-                    print("Failed to parse feedback message:", e)
+                    conn.sendall(length + payload)
+                except (ConnectionResetError, BrokenPipeError):
+                    print("[-] TCP client disconnected.")
+                    break
+        finally:
+            conn.close()
 
-    force_codec(pc, video_sender, "video/H264") 
+threading.Thread(target=tcp_frame_streaming, daemon=True).start()
 
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        print(f"Connection state is {pc.connectionState}")
-        if pc.connectionState == "failed":
-            await pc.close()
-            pcs.discard(pc)
-
-    await pc.setRemoteDescription(offer)
-
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-    # Filter out IPv6 candidates from the SDP answer
-    sdp_lines = pc.localDescription.sdp.split("\n")
-    filtered_lines = [line for line in sdp_lines if not ("a=candidate" in line and "fd7a:115c:" in line)]
-    local_description = RTCSessionDescription(sdp="\n".join(filtered_lines), type=pc.localDescription.type)
-    
-    return web.Response(
-        content_type="application/json",
-        text=json.dumps({"sdp": local_description.sdp, "type": local_description.type}),
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
-        }
-    )
-
-async def on_shutdown(app):
-    coros = [pc.close() for pc in pcs]
-    await asyncio.gather(*coros)
-    pcs.clear()
-
-app2 = web.Application()
-app2.router.add_get("/", index)
-app2.router.add_route("OPTIONS", "/offer/{stream_id}", offer)
-app2.router.add_route("POST", "/offer/{stream_id}", offer)
-app2.on_shutdown.append(on_shutdown)
-
-web.run_app(app2, host="0.0.0.0", port=5000)
+executor.shutdown(wait=True)
