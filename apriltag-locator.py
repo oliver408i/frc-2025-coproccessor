@@ -1,3 +1,4 @@
+# Behold, the Tower of Babel of import statements—somehow both redundant *and* incomplete.
 import numpy as np
 import cv2
 from pupil_apriltags import Detector
@@ -13,6 +14,7 @@ import struct
 import socket
 import threading
 
+# Creating global variables like it’s 1999.
 last_detection_time = time.time()
 raw_frame = None
 sending_frame = False
@@ -21,9 +23,13 @@ sending_frame = False
 IP_ADDRESS = "10.102.52.2"  # Roborio ip
 PORT = 1234
 
+loadExecutor = ThreadPoolExecutor(max_workers=2)
+
+# Ah yes, UDP—the protocol of choice when you like your data delivery like your pizza: unordered and possibly missing.
 # Create a persistent UDP socket
 client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+# Just broadcasting like it’s a college radio station—no encryption, no shame.
 # Enable UDP broadcasting globally
 client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
@@ -37,7 +43,8 @@ frame_lock = threading.Lock()
 intake_frame_lock = threading.Lock()  # Added intake_frame_lock
 intake_annotated_frame_lock = threading.Lock()
 
-@njit(cache=True, fastmath=True) # JIT compile this heavy math function, cache for faster compilation next run, fastmath for less precise, but faster, which is ok in our case
+ # Euler angle extraction—because understanding quaternions is for nerds.
+@njit(cache=True, fastmath=True) # The JIT functions are fast, but the rest of the code moves at the speed of existential dread.
 def extract_euler_angles(R):
     sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
     singular = sy < 1e-6
@@ -54,6 +61,7 @@ def extract_euler_angles(R):
     return roll, pitch, yaw
 
 @njit(cache=True, fastmath=True)
+# Brutal nearest neighbor logic. No sorting, just vibes.
 def find_closest_tag_index(tvecs):
     min_dist = 1e9
     best_idx = -1
@@ -64,6 +72,7 @@ def find_closest_tag_index(tvecs):
             best_idx = i
     return best_idx
 
+# Throwing all CPU threads at this problem like it's a coding Final Boss.
 # AprilTag Detector
 at_detector = Detector(
     families="tag36h11",
@@ -79,38 +88,57 @@ TAG_SIZE = 0.12  # Tag size in meters (12 cm)
 
 print("Starting video capture...")
 
+# Hand-tuned camera magic that only works on THIS laptop, under THIS moon phase.
 RES = (640, 480)
 
-cap = cv2.VideoCapture(0, cv2.CAP_V4L2)  # Use webcam
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
-cap.set(cv2.CAP_PROP_FPS, 60)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, RES[0])
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RES[1])
-cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to reduce capture latency
-cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # 0.25 = manual mode (on some cameras)
-cap.set(cv2.CAP_PROP_EXPOSURE, -7) 
+cap = None
+cap2 = None
 
-cap2 = cv2.VideoCapture(2, cv2.CAP_V4L2)
-cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
-cap2.set(cv2.CAP_PROP_FPS, 60)
-cap2.set(cv2.CAP_PROP_FRAME_WIDTH, RES[0])
-cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, RES[1])
-cap2.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to reduce capture latency
+def initialize_cameras():
+    global cap, cap2
+    # Two camera streams? Bold. Unstable. Glorious chaos.
+    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)  # Use webcam
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
+    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, RES[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RES[1])
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to reduce capture latency
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # 0.25 = manual mode (on some cameras)
+    cap.set(cv2.CAP_PROP_EXPOSURE, -7) 
 
-print("Video captures started.")
+    cap2 = cv2.VideoCapture(2, cv2.CAP_V4L2)
+    cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
+    cap2.set(cv2.CAP_PROP_FPS, 60)
+    cap2.set(cv2.CAP_PROP_FRAME_WIDTH, RES[0])
+    cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, RES[1])
+    cap2.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to reduce capture latency
+    if not cap.isOpened():
+        print("Error: Could not open video stream.")
+        exit(1)
 
-if not cap.isOpened():
-    print("Error: Could not open video stream.")
-    exit(1)
+    if not cap2.isOpened():
+        print("Error: Could not open video stream 2.")
+        exit(1)
 
-if not cap2.isOpened():
-    print("Error: Could not open video stream 2.")
-    exit(1)
+    print("Video captures started.")
+
+ # Classic "hope the camera is plugged in" check.
+
+def prime_jit():
+     # JIT warm-up ritual to avoid that awkward 2-second delay during real work.
+    print("Compiling JIT functions...")
+    # Prime Numba functions to avoid first-call delay
+    extract_euler_angles(np.eye(3))
+    find_closest_tag_index(np.random.rand(10, 3))
+
+loadExecutor.submit(initialize_cameras)
+loadExecutor.submit(prime_jit)
 
 last_sent_zero_time = None
 
 import signal
 
+# The signal handler? Perfectly designed to fail gracefully… if you squint hard enough.
 def handle_sigint(signum, frame):
     print("\nInterrupt received, releasing resources...")
     cap.release()
@@ -121,6 +149,7 @@ def handle_sigint(signum, frame):
 
 signal.signal(signal.SIGINT, handle_sigint)
 
+# "SEND_EVERY_N_FRAMES = 1" – because the network definitely wants *all* the frames, all the time.
 SEND_EVERY_N_FRAMES = 1  # If network is getting oversaturated, turn this up
 frame_counter = 0
 
@@ -134,11 +163,7 @@ frame_lock = threading.Lock()
 
 print("Locks initialized.")
 
-print("Compiling JIT functions...")
-# Prime Numba functions to avoid first-call delay
-extract_euler_angles(np.eye(3))
-find_closest_tag_index(np.random.rand(10, 3))
-
+ # Dedicated threads to babysit two video feeds like helicopter parents.
 def capture_main_frame():
     global latest_frame
     while True:
@@ -149,6 +174,7 @@ def capture_main_frame():
         with frame_lock:
             latest_frame = frame
 
+ # Dedicated threads to babysit two video feeds like helicopter parents.
 def capture_intake_frame():
     global latest_intake_frame
     while True:
@@ -159,12 +185,14 @@ def capture_intake_frame():
         with intake_frame_lock:  # Updated to reapply thread safety
             latest_intake_frame = frame
 
+loadExecutor.shutdown(wait=True)
 executor = ThreadPoolExecutor(max_workers=10)
 executor.submit(capture_main_frame)
 executor.submit(capture_intake_frame)
 
 print("Executors started.")
 
+# "Pipe" detection code so aggressive, it might classify a baguette as industrial plumbing.
 def tag_detection_loop():
     global last_detection_time, last_sent_zero_time, frame_counter, latest_tag_info
     print("Starting tag detection loop...")
@@ -197,6 +225,7 @@ def tag_detection_loop():
         else:
             closest_tag = None
             with tag_info_lock:
+                # When in doubt, return a deeply unhelpful structure full of zeros.
                 latest_tag_info = {"v": None, "l": []}
         
         if closest_tag:
@@ -236,6 +265,7 @@ def tag_detection_loop():
 
 executor.submit(tag_detection_loop)
 
+# Pipe detection: turning color masks and contour spaghetti into half-reliable rectangles.
 def tag_intake_loop():
     global latest_intake_frame, intake_annotated_frame
     print("Starting tag intake loop...")
@@ -294,8 +324,10 @@ def tag_intake_loop():
         with intake_annotated_frame_lock:
             intake_annotated_frame = annotated.copy()
 
-executor.submit(tag_intake_loop)
+# Do not proccess intake frame
+#executor.submit(tag_intake_loop)
 
+# Masterpiece assembler: glues two chaotic streams into one mediocre vertical mosaic.
 def frame_combiner_loop():
     global combined_frame
     latest_main = None
@@ -344,12 +376,15 @@ def frame_combiner_loop():
 threading.Thread(target=frame_combiner_loop, daemon=True).start()
 
 
+# TCP streaming so barebones, it could be used to teach what *not* to do in security class.
 def tcp_frame_streaming():
     TCP_PORT = 9999
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     server_socket.bind(("", TCP_PORT))
+    
+    # One connection only. VIP access. Everyone else can get wrecked.
     server_socket.listen(1)
     print(f"[+] Waiting for TCP client on port {TCP_PORT}...")
 
@@ -403,6 +438,8 @@ def tcp_frame_streaming():
                 # Format: [unsigned short tag_len][tag_json][jpeg_data]
                 payload = struct.pack(">H", tag_length) + tag_bytes + data
                 length = struct.pack(">L", len(payload))
+                
+                # Hope you're on a LAN, because this blob dump would cry on real-world internet.
                 try:
                     conn.sendall(length + payload)
                 except (ConnectionResetError, BrokenPipeError):
@@ -411,6 +448,6 @@ def tcp_frame_streaming():
         finally:
             conn.close()
 
-threading.Thread(target=tcp_frame_streaming, daemon=True).start()
+#threading.Thread(target=tcp_frame_streaming, daemon=True).start()
+tcp_frame_streaming()
 
-executor.shutdown(wait=True)

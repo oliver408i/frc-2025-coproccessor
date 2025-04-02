@@ -79,7 +79,13 @@ def main():
 
             cv2.imshow("Live TCP Video", frame)
 
-            if cv2.waitKey(1) == 27:
+            key = cv2.waitKey(1)
+            if key == ord('p'):
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"snapshot_{timestamp}.jpg"
+                cv2.imwrite(filename, frame)
+                print(f"[+] Snapshot saved as {filename}")
+            elif key == 27:
                 break
 
     except Exception as e:
