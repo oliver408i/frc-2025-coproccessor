@@ -94,10 +94,13 @@ RES = (640, 480)
 cap = None
 cap2 = None
 
+CAM_MAIN_PATH = "/dev/v4l/by-id/usb-046d_C270_HD_WEBCAM_B420BF60-video-index0"
+CAM_INTAKE_PATH = "/dev/v4l/by-id/usb-046d_C270_HD_WEBCAM_F6B19A10-video-index0"
+
 def initialize_cameras():
     global cap, cap2
     # Two camera streams? Bold. Unstable. Glorious chaos.
-    cap = cv2.VideoCapture(0, cv2.CAP_V4L2)  # Use webcam
+    cap = cv2.VideoCapture(CAM_MAIN_PATH, cv2.CAP_V4L2)  # Use webcam
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
     cap.set(cv2.CAP_PROP_FPS, 60)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, RES[0])
@@ -106,7 +109,7 @@ def initialize_cameras():
     cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # 0.25 = manual mode (on some cameras)
     cap.set(cv2.CAP_PROP_EXPOSURE, -7) 
 
-    cap2 = cv2.VideoCapture(2, cv2.CAP_V4L2)
+    cap2 = cv2.VideoCapture(CAM_INTAKE_PATH, cv2.CAP_V4L2)
     cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
     cap2.set(cv2.CAP_PROP_FPS, 60)
     cap2.set(cv2.CAP_PROP_FRAME_WIDTH, RES[0])
