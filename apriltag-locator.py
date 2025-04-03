@@ -1,15 +1,20 @@
+# Behold, the Tower of Babel of import statements—somehow both redundant *and* incomplete.
 import numpy as np
 import cv2
 from pupil_apriltags import Detector
 import socket  # Import socket module
 import time, struct
-from flask import Flask, render_template, Response # type: ignore
 from concurrent.futures import ThreadPoolExecutor
+import asyncio
 
-import base64
 import threading
 from numba import njit
+import json
+import struct
+import socket
+import threading
 
+# Creating global variables like it’s 1999.
 last_detection_time = time.time()
 raw_frame = None
 sending_frame = False
@@ -18,20 +23,28 @@ sending_frame = False
 IP_ADDRESS = "10.102.52.2"  # Roborio ip
 PORT = 1234
 
+loadExecutor = ThreadPoolExecutor(max_workers=2)
+
+# Ah yes, UDP—the protocol of choice when you like your data delivery like your pizza: unordered and possibly missing.
 # Create a persistent UDP socket
 client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# Just broadcasting like it’s a college radio station—no encryption, no shame.
+# Enable UDP broadcasting globally
+client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
 # Load camera calibration parameters
 camera_matrix = np.load("camera_matrix.npy")
 dist_coeffs = np.load("dist_coeffs.npy")
 
-app = Flask(__name__)
+latest_tag_info = None
+tag_info_lock = threading.Lock()
+frame_lock = threading.Lock()
+intake_frame_lock = threading.Lock()  # Added intake_frame_lock
+intake_annotated_frame_lock = threading.Lock()
 
-@app.route('/')
-def index():
-    return render_template('index.html')  # See templates folder, this is the video client
-
-@njit(cache=True, fastmath=True) # JIT compile this heavy math function, cache for faster compilation next run, fastmath for less precise, but faster, which is ok in our case
+ # Euler angle extraction—because understanding quaternions is for nerds.
+@njit(cache=True, fastmath=True) # The JIT functions are fast, but the rest of the code moves at the speed of existential dread.
 def extract_euler_angles(R):
     sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
     singular = sy < 1e-6
@@ -48,6 +61,7 @@ def extract_euler_angles(R):
     return roll, pitch, yaw
 
 @njit(cache=True, fastmath=True)
+# Brutal nearest neighbor logic. No sorting, just vibes.
 def find_closest_tag_index(tvecs):
     min_dist = 1e9
     best_idx = -1
@@ -58,6 +72,7 @@ def find_closest_tag_index(tvecs):
             best_idx = i
     return best_idx
 
+# Throwing all CPU threads at this problem like it's a coding Final Boss.
 # AprilTag Detector
 at_detector = Detector(
     families="tag36h11",
@@ -73,36 +88,60 @@ TAG_SIZE = 0.12  # Tag size in meters (12 cm)
 
 print("Starting video capture...")
 
-cap = cv2.VideoCapture(0, cv2.CAP_V4L2)  # Use webcam
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
-cap.set(cv2.CAP_PROP_FPS, 60)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to reduce capture latency
-cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # 0.25 = manual mode (on some cameras)
-cap.set(cv2.CAP_PROP_EXPOSURE, -7) 
+# Hand-tuned camera magic that only works on THIS laptop, under THIS moon phase.
+RES = (640, 480)
 
-cap2 = cv2.VideoCapture(2, cv2.CAP_V4L2)
-cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
-cap2.set(cv2.CAP_PROP_FPS, 60)
-cap2.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-cap2.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to reduce capture latency
+cap = None
+cap2 = None
 
-print("Video captures started.")
+CAM_MAIN_PATH = "/dev/v4l/by-id/usb-046d_C270_HD_WEBCAM_B420BF60-video-index0"
+CAM_INTAKE_PATH = "/dev/v4l/by-id/usb-046d_C270_HD_WEBCAM_F6B19A10-video-index0"
 
-if not cap.isOpened():
-    print("Error: Could not open video stream.")
-    exit(1)
+def initialize_cameras():
+    global cap, cap2
+    # Two camera streams? Bold. Unstable. Glorious chaos.
+    cap = cv2.VideoCapture(CAM_MAIN_PATH, cv2.CAP_V4L2)  # Use webcam
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
+    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, RES[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RES[1])
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to reduce capture latency
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # 0.25 = manual mode (on some cameras)
+    cap.set(cv2.CAP_PROP_EXPOSURE, -7) 
 
-if not cap2.isOpened():
-    print("Error: Could not open video stream 2.")
-    exit(1)
+    cap2 = cv2.VideoCapture(CAM_INTAKE_PATH, cv2.CAP_V4L2)
+    cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce internal buffering
+    cap2.set(cv2.CAP_PROP_FPS, 60)
+    cap2.set(cv2.CAP_PROP_FRAME_WIDTH, RES[0])
+    cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, RES[1])
+    cap2.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPG to reduce capture latency
+    if not cap.isOpened():
+        print("Error: Could not open video stream.")
+        exit(1)
+
+    if not cap2.isOpened():
+        print("Error: Could not open video stream 2.")
+        exit(1)
+
+    print("Video captures started.")
+
+ # Classic "hope the camera is plugged in" check.
+
+def prime_jit():
+     # JIT warm-up ritual to avoid that awkward 2-second delay during real work.
+    print("Compiling JIT functions...")
+    # Prime Numba functions to avoid first-call delay
+    extract_euler_angles(np.eye(3))
+    find_closest_tag_index(np.random.rand(10, 3))
+
+loadExecutor.submit(initialize_cameras)
+loadExecutor.submit(prime_jit)
 
 last_sent_zero_time = None
 
 import signal
 
+# The signal handler? Perfectly designed to fail gracefully… if you squint hard enough.
 def handle_sigint(signum, frame):
     print("\nInterrupt received, releasing resources...")
     cap.release()
@@ -113,28 +152,21 @@ def handle_sigint(signum, frame):
 
 signal.signal(signal.SIGINT, handle_sigint)
 
+# "SEND_EVERY_N_FRAMES = 1" – because the network definitely wants *all* the frames, all the time.
 SEND_EVERY_N_FRAMES = 1  # If network is getting oversaturated, turn this up
 frame_counter = 0
 
 latest_frame = None
 latest_intake_frame = None
-intake_annotated_frame = None
-annotated_frame = None
+combined_frame = None
+
 
 print("Starting threads...")
 frame_lock = threading.Lock()
 
-annotated_frame_lock = threading.Lock()
-intake_frame_lock = threading.Lock()
-intake_annotated_frame_lock = threading.Lock()
-
 print("Locks initialized.")
 
-print("Compiling JIT functions...")
-# Prime Numba functions to avoid first-call delay
-extract_euler_angles(np.eye(3))
-find_closest_tag_index(np.random.rand(10, 3))
-
+ # Dedicated threads to babysit two video feeds like helicopter parents.
 def capture_main_frame():
     global latest_frame
     while True:
@@ -145,6 +177,7 @@ def capture_main_frame():
         with frame_lock:
             latest_frame = frame
 
+ # Dedicated threads to babysit two video feeds like helicopter parents.
 def capture_intake_frame():
     global latest_intake_frame
     while True:
@@ -152,17 +185,19 @@ def capture_intake_frame():
         ret, frame = cap2.retrieve()
         if not ret or frame is None:
             continue
-        with intake_frame_lock:
+        with intake_frame_lock:  # Updated to reapply thread safety
             latest_intake_frame = frame
 
-executor = ThreadPoolExecutor(max_workers=5)
+loadExecutor.shutdown(wait=True)
+executor = ThreadPoolExecutor(max_workers=10)
 executor.submit(capture_main_frame)
 executor.submit(capture_intake_frame)
 
 print("Executors started.")
 
+# "Pipe" detection code so aggressive, it might classify a baguette as industrial plumbing.
 def tag_detection_loop():
-    global last_detection_time, last_sent_zero_time, annotated_frame, frame_counter
+    global last_detection_time, last_sent_zero_time, frame_counter, latest_tag_info
     print("Starting tag detection loop...")
     while True:
         with frame_lock:
@@ -192,6 +227,9 @@ def tag_detection_loop():
             closest_tag = tag_data[idx]
         else:
             closest_tag = None
+            with tag_info_lock:
+                # When in doubt, return a deeply unhelpful structure full of zeros.
+                latest_tag_info = {"v": None, "l": []}
         
         if closest_tag:
             tag, tvec, rvec = closest_tag
@@ -209,19 +247,14 @@ def tag_detection_loop():
                 client_socket.sendto(struct.pack("ffffff", 0, 0, 0, x_offset, z_offset, pitchd), (IP_ADDRESS, PORT))
                 #print("Sent PID corrections:", x_correction, z_correction, yaw_correction)
             
-            cv2.putText(frame, f"X: {x_offset:.2f}m, Y: {y_offset:.2f}m, Z: {z_offset:.2f}m", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, f"Roll: {np.degrees(roll):.2f}, Pitch: {pitchd:.2f}, Yaw: {np.degrees(yaw):.2f}", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, f"Raw tvec: X={tvec[0][0]:.2f}, Y={tvec[1][0]:.2f}, Z={tvec[2][0]:.2f}", (10, 120),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            for i in range(4):
-                pt1 = tuple(corners[i].astype(int))
-                pt2 = tuple(corners[(i + 1) % 4].astype(int))
-                cv2.line(frame, pt1, pt2, (0, 255, 0), 2)
-        with annotated_frame_lock:
-            annotated_frame = frame.copy()
+            with tag_info_lock:
+                latest_tag_info = {
+                    "v": [round(x_offset, 2), round(y_offset, 2), round(z_offset, 2),
+                          round(np.degrees(roll), 1), round(pitchd, 1), round(np.degrees(yaw), 1)],
+                    "l": [[int(corners[i][0]), int(corners[i][1]),
+                           int(corners[(i + 1) % 4][0]), int(corners[(i + 1) % 4][1])]
+                          for i in range(4)]
+                }
 
         if tags:
             last_detection_time = time.time()
@@ -235,13 +268,14 @@ def tag_detection_loop():
 
 executor.submit(tag_detection_loop)
 
+# Pipe detection: turning color masks and contour spaghetti into half-reliable rectangles.
 def tag_intake_loop():
     global latest_intake_frame, intake_annotated_frame
     print("Starting tag intake loop...")
     MIN_AREA = 500  # Minimum contour area to be considered a pipe
 
     while True:
-        with intake_frame_lock:
+        with intake_frame_lock:  # Updated to reapply thread safety
             if latest_intake_frame is None:
                 continue
             frame = latest_intake_frame.copy()
@@ -293,55 +327,130 @@ def tag_intake_loop():
         with intake_annotated_frame_lock:
             intake_annotated_frame = annotated.copy()
 
-executor.submit(tag_intake_loop)
+# Do not proccess intake frame
+#executor.submit(tag_intake_loop)
 
-def generate_mjpeg():
+# Masterpiece assembler: glues two chaotic streams into one mediocre vertical mosaic.
+def frame_combiner_loop():
+    global combined_frame
+    latest_main = None
+    latest_intake = None
+
     while True:
-        with annotated_frame_lock:
-            if annotated_frame is None:
-                continue
-            ret, jpeg = cv2.imencode('.jpg', annotated_frame)
-            if not ret:
-                continue
-            frame = jpeg.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        updated = False
 
-def generate_raw_mjpeg():
+        if frame_lock.acquire(blocking=False):
+            try:
+                if latest_frame is not None:
+                    latest_main = latest_frame.copy()
+                    updated = True
+            finally:
+                frame_lock.release()
+
+        if intake_frame_lock.acquire(blocking=False):
+            try:
+                if latest_intake_frame is not None:
+                    latest_intake = latest_intake_frame.copy()
+                    updated = True
+            finally:
+                intake_frame_lock.release()
+
+        if not updated:
+            time.sleep(0.005)
+            continue
+
+        labeled_frames = []
+        for label, frame in zip(["Main", "Intake"], [latest_main, latest_intake]):
+            if frame is None:
+                continue
+            labeled = frame.copy()
+            cv2.putText(labeled, label, (10, labeled.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+            labeled_frames.append(labeled)
+
+        if not labeled_frames:
+            continue
+
+        height, width = labeled_frames[0].shape[:2]
+        for i in range(len(labeled_frames)):
+            labeled_frames[i] = cv2.resize(labeled_frames[i], (width, height))
+
+        combined_frame = cv2.vconcat(labeled_frames)
+
+threading.Thread(target=frame_combiner_loop, daemon=True).start()
+
+
+# TCP streaming so barebones, it could be used to teach what *not* to do in security class.
+def tcp_frame_streaming():
+    TCP_PORT = 9999
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    server_socket.bind(("", TCP_PORT))
+    
+    # One connection only. VIP access. Everyone else can get wrecked.
+    server_socket.listen(1)
+    print(f"[+] Waiting for TCP client on port {TCP_PORT}...")
+
     while True:
-        with frame_lock:
-            if latest_frame is None:
-                continue
-            ret, jpeg = cv2.imencode('.jpg', latest_frame)
-            if not ret:
-                continue
-            frame = jpeg.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        conn, addr = server_socket.accept()
+        print(f"[+] TCP client connected from {addr}")
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-def generate_intake_mjpeg():
-    while True:
-        with intake_annotated_frame_lock:
-            if intake_annotated_frame is None:
-                continue
-            ret, jpeg = cv2.imencode('.jpg', intake_annotated_frame)
-            if not ret:
-                continue
-            frame = jpeg.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        try:
+            last_send_time = 0
+            SEND_INTERVAL = 1/20
 
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+            while True:
+                if combined_frame is None:
+                    time.sleep(0.005)
+                    continue
 
-@app.route('/raw_video_feed')
-def raw_video_feed():
-    return Response(generate_raw_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+                now = time.time()
+                if now - last_send_time < SEND_INTERVAL:
+                    time.sleep(0.0001)
+                    continue
+                last_send_time = now
 
-@app.route('/intake_video_feed')
-def video_intake_feed():
-    return Response(generate_intake_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+                success, encoded = cv2.imencode('.jpg', combined_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
+                if not success:
+                    continue
 
-print("Starting server...")
-app.run(host="0.0.0.0", port=5000)
+                data = encoded.tobytes()
+                tag_json = ""
+                with tag_info_lock:
+                    if latest_tag_info is not None:
+                        def convert(obj):
+                            if isinstance(obj, np.generic):
+                                return obj.item()
+                            if isinstance(obj, tuple):
+                                return [convert(i) for i in obj]
+                            if isinstance(obj, list):
+                                return [convert(i) for i in obj]
+                            if isinstance(obj, dict):
+                                return {k: convert(v) for k, v in obj.items()}
+                            return obj
+
+                        safe_tag_info = convert(latest_tag_info)
+                        tag_json = json.dumps(safe_tag_info)
+                    else:
+                        tag_json = json.dumps({"text_lines": ["No tag detected"], "lines": []})
+
+                tag_bytes = tag_json.encode("utf-8")
+                tag_length = len(tag_bytes)
+
+                # Format: [unsigned short tag_len][tag_json][jpeg_data]
+                payload = struct.pack(">H", tag_length) + tag_bytes + data
+                length = struct.pack(">L", len(payload))
+                
+                # Hope you're on a LAN, because this blob dump would cry on real-world internet.
+                try:
+                    conn.sendall(length + payload)
+                except (ConnectionResetError, BrokenPipeError):
+                    print("[-] TCP client disconnected.")
+                    break
+        finally:
+            conn.close()
+
+#threading.Thread(target=tcp_frame_streaming, daemon=True).start()
+tcp_frame_streaming()
+
