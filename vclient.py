@@ -1,17 +1,18 @@
 import socket
 import time
-VPN_IP = "100.64.0.5"  # Set to your VPN interface IP
 import cv2
 import numpy as np
 import struct
 import json
 
+server_ip = '100.64.0.18'  # Replace with your server's IP
 PORT = 9999
 BUFFER_SIZE = 65535  # Max UDP packet size
 payload_size = struct.calcsize(">L")
 
+
 def main():
-    server_ip = '100.64.0.18'  # Replace with your server's IP
+    
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)

@@ -95,7 +95,7 @@ cap = None
 cap2 = None
 
 CAM_MAIN_PATH = "/dev/v4l/by-id/usb-046d_C270_HD_WEBCAM_B420BF60-video-index0"
-CAM_INTAKE_PATH = "/dev/v4l/by-id/usb-046d_C270_HD_WEBCAM_F6B19A10-video-index0"
+CAM_INTAKE_PATH = "/dev/v4l/by-id/usb-046d_C270_HD_WEBCAM_AC0DAA10-video-index0"
 
 def initialize_cameras():
     global cap, cap2
@@ -185,7 +185,12 @@ def capture_intake_frame():
         ret, frame = cap2.retrieve()
         if not ret or frame is None:
             continue
-        with intake_frame_lock:  # Updated to reapply thread safety
+        cv2.putText(frame, "CORAL FALLS BEYOND HERE", (5, int(frame.shape[0] * 0.2) + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        cv2.line(frame, (0, int(frame.shape[0] * 0.25) + 5), (frame.shape[1], int(frame.shape[0] * 0.25) + 5), (0, 255, 255), 2)
+        cv2.putText(frame, "INTAKE PAST HERE", (5, int(frame.shape[0] * 0.47) + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        cv2.line(frame, (0, int(frame.shape[0] * 0.47) + 5), (frame.shape[1], int(frame.shape[0] * 0.47) + 5), (0, 255, 255), 2)
+        
+        with intake_frame_lock:
             latest_intake_frame = frame
 
 loadExecutor.shutdown(wait=True)
@@ -195,7 +200,7 @@ executor.submit(capture_intake_frame)
 
 print("Executors started.")
 
-# "Pipe" detection code so aggressive, it might classify a baguette as industrial plumbing.
+# Apriltag detection loop
 def tag_detection_loop():
     global last_detection_time, last_sent_zero_time, frame_counter, latest_tag_info
     print("Starting tag detection loop...")
@@ -411,7 +416,7 @@ def tcp_frame_streaming():
                     continue
                 last_send_time = now
 
-                success, encoded = cv2.imencode('.jpg', combined_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
+                success, encoded = cv2.imencode('.jpg', combined_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 10])
                 if not success:
                     continue
 
